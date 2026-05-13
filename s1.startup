@@ -1,0 +1,31 @@
+cd /
+
+# Compile P4 program – ha hibázik, loggoljuk és ne faggyon be a startup
+p4c P4DNSMonitor.p4 > /tmp/p4c.log 2>&1
+if [ $? -ne 0 ]; then
+    echo "P4 FORDITAS HIBA – lasd: /tmp/p4c.log" > /tmp/sw.log
+    exit 1
+fi
+
+# Start BMv2 simple_switch (port 1 = eth0/client, port 2 = eth1/server)
+simple_switch -i 1@eth0 -i 2@eth1 --thrift-port 9090 --log-file /tmp/sw.log P4DNSMonitor.json &
+
+# Wait for switch process to start
+while [[ $(pgrep simple_switch) -eq 0 ]]; do sleep 1; done
+
+# Wait for Thrift interface to be ready (max 30 masodperc)
+TRIES=0
+until simple_switch_CLI --thrift-port 9090 <<< "help" 2>/dev/null | grep -q "table_add"; do
+    sleep 1
+    TRIES=$((TRIES + 1))
+    if [ $TRIES -ge 30 ]; then
+        echo "simple_switch nem indult el 30 masodperc alatt" >> /tmp/sw.log
+        exit 1
+    fi
+done
+
+# Load initial forwarding rules
+simple_switch_CLI --thrift-port 9090 <<< $(cat commands.txt)
+
+# Start the DNS stats controller in background
+python3 controller.py --thrift-port 9090 --interval 10 &

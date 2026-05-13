@@ -112,3 +112,69 @@ The controller inserts a single rule at runtime — e.g., block all `QTYPE=MX` (
 | Python 3 + thrift                                                | Runtime register access from controller      |
 
 ---
+
+## 7. Repository Layout
+
+- `P4DNSMonitor.p4` — P4 program for DNS packet parsing, telemetry, and block rules
+- `controller.py` — Python CLI controller for register inspection and block rule management
+- `dns_test.py` — Scapy-based DNS query generator for verification
+- `build.sh` — P4 compilation helper script
+- `kathara.yml` — Kathara topology definition for client/router/server emulation
+- `requirements.txt` — Python dependencies for the controller and test script
+- `.gitignore` — project ignore rules
+
+## 8. Getting Started
+
+1. Compile the P4 program:
+   ```bash
+   ./build.sh
+   ```
+
+2. Start the Kathara topology:
+   ```bash
+   kathara start
+   ```
+
+3. Launch BMv2 in the router node with the compiled JSON and a Thrift port:
+   ```bash
+   kathara exec router -- simple_switch_CLI --thrift-port 9090
+   ```
+   or run the BMv2 simple switch inside the router container directly with `build/P4DNSMonitor.json`.
+
+4. Use the Python controller to read counters and manage block rules:
+   ```bash
+   python3 controller.py --thrift-port 9090
+   ```
+
+5. Generate DNS traffic from a connected host:
+   ```bash
+   python3 dns_test.py --target 10.0.0.2
+   ```
+
+## 9. Example Controller Usage
+
+- Read statistics continuously:
+  ```bash
+  python3 controller.py --thrift-port 9090
+  ```
+
+- Block all MX queries:
+  ```bash
+  python3 controller.py --thrift-port 9090 --clear --block-qtype 15
+  ```
+
+- Block DNS names starting with `blocked`:
+  ```bash
+  python3 controller.py --thrift-port 9090 --clear --block-name blocked
+  ```
+
+- Print one-shot stats:
+  ```bash
+  python3 controller.py --thrift-port 9090 --once
+  ```
+
+## 10. Notes
+
+- The P4 parser extracts the first DNS QNAME label and QTYPE field at a predictable offset.
+- Telemetry is stored in BMv2 registers that are readable from user space via the controller.
+- The block table supports ternary matches so the controller can block either by QTYPE or by name-prefix hash.

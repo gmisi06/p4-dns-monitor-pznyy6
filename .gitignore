@@ -1,0 +1,7 @@
+build/
+*.json
+*.p4info.txt
+__pycache__/
+*.pyc
+/tmp/
+*.log
