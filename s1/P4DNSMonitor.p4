@@ -134,7 +134,10 @@ parser MyParser(packet_in packet,
 
     state parse_dns {
         packet.extract(hdr.dns);
-        transition parse_dns_qname;
+        transition select(hdr.dns.qr) {
+            0: parse_dns_qname;   // query: has question section
+            default: accept;       // response: only header guaranteed
+        }
     }
 
     /* Peek at the first label-length byte, then extract that many bytes as
@@ -245,9 +248,6 @@ control MyIngress(inout headers hdr,
 
                 /* --- Blocking check --- */
                 if (dns_block.apply().hit) {
-                    /* dns_drop() már meghívta mark_to_drop()-ot.
-                       Megszámoljuk a blokkolt csomagot az apply blokkban,
-                       ahol a register műveletek biztosan támogatottak. */
                     bit<32> bt_idx = (bit<32>)hdr.dns_question.qtype;
                     if (bt_idx < 256) {
                         bit<32> bt_val;

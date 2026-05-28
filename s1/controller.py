@@ -11,6 +11,7 @@ Usage:
   python3 controller.py --clear --block-qtype 1  # replace block rule
   python3 controller.py --clear                  # remove all block rules
   python3 controller.py --show-blocked           # show dropped packet counts by QTYPE
+  python3 controller.py --list-rules             # list currently configured block rules
 """
 
 import argparse
@@ -118,7 +119,10 @@ def block_qtype(qtype: int, thrift_port: int) -> None:
 
 def clear_blocks(thrift_port: int) -> None:
     out = _cli('table_clear dns_block', thrift_port)
-    print(f'[+] dns_block table cleared.')
+    if 'error' in out.lower():
+        print(f'[!] CLI response: {out.strip()}')
+    else:
+        print('[+] dns_block table cleared.')
 
 
 def show_blocked(thrift_port: int) -> None:
@@ -137,6 +141,30 @@ def show_blocked(thrift_port: int) -> None:
     print()
 
 
+def list_rules(thrift_port: int) -> None:
+    """Print the DNS QTYPE block rules currently installed in the P4 dns_block table."""
+    out = _cli('table_dump dns_block', thrift_port)
+    # BMv2 table_dump separates entries with lines of '*****'.
+    # Each entry block looks like:
+    #   * hdr.dns_question.qtype : EXACT     001e
+    #   Action entry: P4DNSMonitor.dns_drop -
+    qtypes = []
+    for block in re.split(r'\*{5,}', out):
+        if 'dns_drop' in block:
+            m = re.search(r'EXACT\s+([0-9a-fA-F]+)', block)
+            if m:
+                qtypes.append(int(m.group(1), 16))
+
+    print('\nCurrently blocked DNS query types:')
+    if not qtypes:
+        print('  (none — all query types are currently allowed)')
+    else:
+        for qt_num in sorted(qtypes):
+            name = QTYPE_NAMES.get(qt_num, 'UNKNOWN')
+            print(f'  - QTYPE {qt_num:>3}  ({name})')
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='P4 DNS Monitor Controller')
     parser.add_argument('--thrift-port', type=int, default=9090,
@@ -151,7 +179,13 @@ def main() -> None:
                         help='Dashboard refresh interval in seconds (default: 5)')
     parser.add_argument('--show-blocked', action='store_true',
                         help='Show blocked packet counts by QTYPE and exit')
+    parser.add_argument('--list-rules', action='store_true',
+                        help='List DNS QTYPE block rules currently installed in the switch and exit')
     args = parser.parse_args()
+
+    if args.list_rules:
+        list_rules(args.thrift_port)
+        return
 
     if args.show_blocked:
         show_blocked(args.thrift_port)

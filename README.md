@@ -1,180 +1,245 @@
-# Project 14 – DNS Packet Filter / Monitor
+# P4 DNS Monitor
 
-**Implementation Plan · Gönye Mihály (PZNYY6)**
+DNS traffic monitoring and filtering system built with P4, BMv2, and Kathara.
 
----
-
-## 1. Overview
-
-This project implements a DNS Packet Filter and Monitor using **P4** (Portable Switch Architecture) with the **Kathara** network emulation framework and the **BMv2** software switch. The system parses live UDP/53 DNS traffic at the data-plane level, collects per-query-type telemetry, and enforces a configurable blocking rule — all without touching the host's kernel.
+The P4 program runs on a software switch between a client and a DNS server. It inspects every DNS packet at the data plane, maintains counters per query type and per source IP, and enforces configurable drop rules — all without touching the host kernel.
 
 ---
 
-## 2. Goals & Scope
-
-- Detect DNS query and response packets (QR flag in DNS header)
-- Count traffic per DNS query type (A, AAAA, MX, CNAME, PTR, …) using P4 registers
-- Count per-client (source IP) query volume
-- Block a single configurable domain pattern **or** resource-record type via a P4 match-action table
-- Export collected stats to a user-space Python controller (dashboard / CLI)
-
-> **Note:** Full DNS name decompression is not feasible in P4. Fixed-offset parsing (first QNAME label, QTYPE field) is sufficient for all required tasks.
-
----
-
-## 3. System Architecture
-
-### 3.1 Kathara Topology
-
-Two end-hosts (`client`, `server`) connected through a P4-enabled BMv2 router node. DNS traffic flows from client → BMv2 → server (resolver).
+## Architecture
 
 ```
-client ── eth0 ── [BMv2 p4-router] ── eth1 ── server/resolver
+client (10.0.0.1)
+    eth0
+      |
+    [s1 — BMv2 simple_switch running P4DNSMonitor.p4]
+      |
+    eth1
+server (10.0.0.2)
 ```
 
-### 3.2 P4 Pipeline
+### P4 pipeline (`s1/P4DNSMonitor.p4`)
 
-| Stage               | Description                                                                  |
-| ------------------- | ---------------------------------------------------------------------------- |
-| **Parser**          | Ethernet → IPv4 → UDP → DNS header extraction                                |
-| **Ingress control** | QR-bit check, QTYPE extraction, register updates, drop logic                 |
-| **Egress**          | Pass-through (no modification needed for monitoring)                         |
-| **Control plane**   | `runtime_CLI` / Python Thrift API to insert table entries and read registers |
+**Parser** — Ethernet → IPv4 → UDP → DNS header → QNAME (first label) → QTYPE/QCLASS
 
----
+**Tables:**
 
-## 4. Implementation Phases
+| Table | Match key | Actions | Default |
+|---|---|---|---|
+| `port_forward` | ingress port (exact) | `do_forward(port)`, `drop` | drop |
+| `dns_block` | DNS QTYPE (exact, 16-bit) | `dns_drop`, `NoAction` | NoAction (allow) |
 
-| Phase             | Task                                                                     |
-| ----------------- | ------------------------------------------------------------------------ |
-| **1 – Setup**     | Kathara topology (2 hosts + router) + BMv2 switch                        |
-| **2 – Parsing**   | Parse Ethernet/IP/UDP headers; extract DNS payload at fixed offsets      |
-| **3 – Telemetry** | QR-bit detection; per-type (A/AAAA/MX/…) counters via registers          |
-| **4 – Blocking**  | Match-action table for configurable domain hash / RR type drop rule      |
-| **5 – Userspace** | Python controller: reads registers, prints stats, configures block rules |
-| **6 – Testing**   | Scapy-generated DNS traffic; verify counts + drops                       |
+**Registers (indexed counters, readable from user space):**
 
----
+| Register | Size | Index | Counts |
+|---|---|---|---|
+| `qr_counter` | 2 | 0 = query, 1 = response | total queries / responses |
+| `qtype_counter` | 256 | QTYPE value | packets per DNS record type |
+| `client_counter` | 256 | last octet of source IP | queries per 10.0.0.X client |
+| `blocked_counter` | 256 | QTYPE value | dropped packets per record type |
 
-## 5. Key Technical Details
-
-### 5.1 DNS Header Parsing (Fixed-Offset)
-
-DNS sits at a fixed byte offset after the UDP payload. The P4 parser extracts:
-
-- Transaction ID (2 bytes)
-- Flags field: QR bit (bit 15), OPCODE, RD, RA
-- `QDCOUNT` – number of questions
-- `QTYPE` – 2 bytes at offset +4 after the QNAME label _(assumes single-label or known-length name)_
-
-The QNAME is variable-length; parsing stops after the first label to extract QTYPE at a predictable offset. This is the standard P4 approach for partial DNS inspection.
-
-### 5.2 Telemetry Registers
-
-```p4
-register<bit<32>>(16)  qtype_counter;   // indexed by QTYPE value (up to 15 types)
-register<bit<32>>(256) client_counter;  // indexed by last octet of src IP
-register<bit<32>>(2)   qr_counter;      // index 0 = queries, index 1 = responses
+**Ingress logic (simplified):**
+```
+if DNS packet:
+    increment qr_counter[QR flag]
+    increment qtype_counter[QTYPE]
+    increment client_counter[src_ip last octet]
+    apply dns_block:
+        hit  → increment blocked_counter[QTYPE], drop packet
+        miss → apply port_forward, forward packet
+else:
+    apply port_forward, forward packet
 ```
 
-### 5.3 Blocking Table
+---
 
-A ternary match-action table keyed on QTYPE and/or a 4-byte QNAME prefix hash:
+## Quick Start
 
-```p4
-table dns_block {
-    key = {
-        hdr.dns.qtype : exact;
-    }
-    actions = { drop; NoAction; }
-}
+```bash
+# 1. Start the Kathara lab (compiles P4, starts BMv2, loads forwarding rules,
+#    and launches the controller dashboard automatically via s1.startup)
+kathara lstart
+
+# 2. Start the DNS listener on the server node (must be done manually)
+kathara exec server -- python3 dns_listener.py
+
+# 3. Send test DNS traffic from the client node
+kathara exec client -- python3 dns_test.py
 ```
 
-The controller inserts a single rule at runtime — e.g., block all `QTYPE=MX` (value 15) packets.
+---
 
-### 5.4 User-Space Controller
+## Controller — `s1/controller.py`
 
-- Reads register arrays via the BMv2 `runtime_CLI` or Thrift API
-- Displays a live CLI table of per-type counts every N seconds
-- Accepts CLI arguments to set the blocked QTYPE and push the table entry
-- Optional: simple HTTP endpoint for a stats dashboard
+Communicates with the BMv2 switch over the Thrift API (default port 9090).
+Run from inside the `s1` container or via `kathara exec s1 --`.
+
+### Dashboard / stats
+
+```bash
+python3 controller.py
+```
+Live-refreshing dashboard showing total queries, responses, per-QTYPE counts, and per-client counts. Refreshes every 5 seconds. Press Ctrl+C to exit.
+
+```bash
+python3 controller.py --once
+```
+Prints the dashboard once and exits immediately.
+
+```bash
+python3 controller.py --interval 10
+```
+Sets the dashboard refresh interval to 10 seconds (default: 5).
+
+### Block rules
+
+```bash
+python3 controller.py --block-qtype 15
+```
+Installs a drop rule in the `dns_block` table for QTYPE 15 (MX). All incoming DNS queries of that type are silently dropped at the data plane from this point on. The rule persists until `--clear` is run or the switch is restarted.
+
+```bash
+python3 controller.py --block-qtype 28
+```
+Same, but for QTYPE 28 (AAAA — IPv6 address queries).
+
+```bash
+python3 controller.py --clear
+```
+Removes **all** entries from the `dns_block` table (`table_clear dns_block`). All query types are allowed again.
+
+```bash
+python3 controller.py --clear --block-qtype 1
+```
+Clears existing rules first, then installs a single new rule (here: block QTYPE 1 / A records). Use this pattern to replace the current blocklist rather than append to it.
+
+### Inspecting the blocklist
+
+```bash
+python3 controller.py --list-rules
+```
+Reads the live contents of the `dns_block` P4 table and prints which QTYPE values currently have a drop rule installed. This reflects the current switch configuration, regardless of whether any traffic has been seen.
+
+Example output:
+```
+Currently blocked DNS query types:
+  - QTYPE  15  (MX)
+  - QTYPE  28  (AAAA)
+```
+
+```bash
+python3 controller.py --show-blocked
+```
+Reads the `blocked_counter` register and shows how many packets of each type have been dropped since the switch started. This is historical data — it accumulates across rule changes and is only reset on switch restart.
+
+Example output:
+```
+  Blocked packets (total: 25)
+  QTYPE  Name     Dropped
+  --------------------------
+  15     MX            10  <-- BLOCKED
+  28     AAAA          15  <-- BLOCKED
+```
+
+> **`--list-rules` vs `--show-blocked`:**
+> `--list-rules` shows what the switch is *configured* to block right now (table entries).
+> `--show-blocked` shows what has *already been dropped* (register history).
+> A rule with no matching traffic yet appears in `--list-rules` but not in `--show-blocked`.
+> After `--clear`, `--list-rules` shows nothing but `--show-blocked` still shows past drops.
+
+### Thrift port
+
+```bash
+python3 controller.py --thrift-port 9091
+```
+Connect to a BMv2 instance on a non-default Thrift port. Default is 9090.
 
 ---
 
-## 6. Dependencies
+## Test Traffic Generator — `client/dns_test.py`
 
-| Tool                                                             | Purpose                                      |
-| ---------------------------------------------------------------- | -------------------------------------------- |
-| [Kathara](https://github.com/KatharaFramework/Kathara)           | Network emulation (Docker-based)             |
-| [p4c](https://github.com/p4lang/p4c)                             | P4 compiler (targeting BMv2 / simple_switch) |
-| [BMv2 simple_switch](https://github.com/p4lang/behavioral-model) | Software P4 target                           |
-| Python 3 + Scapy                                                 | Test traffic generation                      |
-| Python 3 + thrift                                                | Runtime register access from controller      |
+Sends crafted DNS query packets using Scapy. Run from inside the `client` container.
+
+> **Note:** The P4 parser extracts only the first QNAME label. Use single-label names (e.g. `test`, `mail`) — multi-label names like `example.com` cause QTYPE misalignment.
+
+### Send the default test suite
+
+```bash
+python3 dns_test.py
+```
+Sends 5 packets each for: A, AAAA, MX, PTR, NS, CNAME, SRV, TXT. Target: 10.0.0.2, source interface: eth0.
+
+### Options
+
+```bash
+python3 dns_test.py --count 20
+```
+Send 20 packets per query type instead of 5.
+
+```bash
+python3 dns_test.py --qtype 15 --name mail
+```
+Send only QTYPE 15 (MX) queries with the QNAME label `mail`.
+
+```bash
+python3 dns_test.py --target 10.0.0.2 --src 10.0.0.1 --iface eth0
+```
+Override destination IP, source IP, and network interface.
+
+```bash
+python3 dns_test.py --verbose
+```
+Enable Scapy's verbose packet output.
 
 ---
 
-## 7. Repository Layout
+## DNS QTYPE Reference
 
-- `P4DNSMonitor.p4` — P4 program for DNS packet parsing, telemetry, and block rules
-- `controller.py` — Python CLI controller for register inspection and block rule management
-- `dns_test.py` — Scapy-based DNS query generator for verification
-- `build.sh` — P4 compilation helper script
-- `kathara.yml` — Kathara topology definition for client/router/server emulation
-- `requirements.txt` — Python dependencies for the controller and test script
-- `.gitignore` — project ignore rules
+| QTYPE | Name | Description |
+|---|---|---|
+| 1 | A | IPv4 address |
+| 2 | NS | Name server |
+| 5 | CNAME | Canonical name (alias) |
+| 6 | SOA | Start of authority |
+| 12 | PTR | Reverse lookup |
+| 15 | MX | Mail exchange |
+| 16 | TXT | Text record |
+| 28 | AAAA | IPv6 address |
+| 33 | SRV | Service locator |
+| 255 | ANY | All records |
 
-## 8. Getting Started
+---
 
-1. Compile the P4 program:
-   ```bash
-   ./build.sh
-   ```
+## File Layout
 
-2. Start the Kathara topology:
-   ```bash
-   kathara start
-   ```
+```
+p4-dns-monitor/
+├── lab.conf              Kathara topology (client, s1, server)
+├── s1.startup            s1 init: compile P4, start BMv2, load rules, start controller
+├── client.startup        client init: set MAC, IP, static ARP
+├── server.startup        server init: set MAC, IP, static ARP (DNS listener manual)
+├── build.sh              standalone P4 compilation helper
+├── requirements.txt      Python dependencies (scapy)
+│
+├── s1/
+│   ├── P4DNSMonitor.p4   P4 data-plane program
+│   ├── controller.py     Python controller (dashboard + block rule management)
+│   └── commands.txt      Initial port_forward table entries loaded at startup
+│
+├── client/
+│   └── dns_test.py       Scapy-based DNS traffic generator
+│
+└── server/
+    └── dns_listener.py   Minimal UDP/53 listener that echoes responses
+```
 
-3. Launch BMv2 in the router node with the compiled JSON and a Thrift port:
-   ```bash
-   kathara exec router -- simple_switch_CLI --thrift-port 9090
-   ```
-   or run the BMv2 simple switch inside the router container directly with `build/P4DNSMonitor.json`.
+---
 
-4. Use the Python controller to read counters and manage block rules:
-   ```bash
-   python3 controller.py --thrift-port 9090
-   ```
+## Dependencies
 
-5. Generate DNS traffic from a connected host:
-   ```bash
-   python3 dns_test.py --target 10.0.0.2
-   ```
-
-## 9. Example Controller Usage
-
-- Read statistics continuously:
-  ```bash
-  python3 controller.py --thrift-port 9090
-  ```
-
-- Block all MX queries:
-  ```bash
-  python3 controller.py --thrift-port 9090 --clear --block-qtype 15
-  ```
-
-- Block DNS names starting with `blocked`:
-  ```bash
-  python3 controller.py --thrift-port 9090 --clear --block-name blocked
-  ```
-
-- Print one-shot stats:
-  ```bash
-  python3 controller.py --thrift-port 9090 --once
-  ```
-
-## 10. Notes
-
-- The P4 parser extracts the first DNS QNAME label and QTYPE field at a predictable offset.
-- Telemetry is stored in BMv2 registers that are readable from user space via the controller.
-- The block table supports ternary matches so the controller can block either by QTYPE or by name-prefix hash.
+| Tool | Purpose |
+|---|---|
+| [Kathara](https://github.com/KatharaFramework/Kathara) | Network emulation (Docker-based containers) |
+| [p4c](https://github.com/p4lang/p4c) | P4 compiler targeting BMv2 |
+| [BMv2 simple_switch](https://github.com/p4lang/behavioral-model) | Software P4 switch |
+| Python 3 + Scapy | DNS packet generation (`dns_test.py`) |

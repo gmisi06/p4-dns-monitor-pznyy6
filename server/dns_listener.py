@@ -8,6 +8,6 @@ print('Listening on :53 ...')
 while True:
     data, addr = s.recvfrom(512)
     print(f'DNS query from {addr[0]}: {len(data)} bytes')
-    resp = bytearray(data[:12])
+    resp = bytearray(data)
     resp[2] = (resp[2] | 0x80) & 0xFF
     s.sendto(bytes(resp), addr)

@@ -41,7 +41,7 @@ def send_query(
     """Send `count` DNS queries for `qname` of type `qtype` to `dst_ip`."""
     # Scapy encodes qname='test' -> b'\x04test\x00' (single-label wire format)
     pkt = (
-        Ether(dst='00:00:0a:00:00:02')  # server MAC – P4 switch forwards by port, MAC nem kell egyezzen
+        Ether(dst='00:00:0a:00:00:02')  # server MAC – P4 switch forwards by port, exact MAC match is not required
         / IP(src=src_ip, dst=dst_ip)
         / UDP(sport=RandShort(), dport=53)
         / DNS(rd=1, qd=DNSQR(qname=qname, qtype=qtype))
